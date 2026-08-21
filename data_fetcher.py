@@ -780,18 +780,128 @@ def validate_symbol_detailed(
     }
 
 
-def validate_symbol(symbol: str, asset_type: Optional[str] = None) -> bool:
+def validate_symbol(symbol: str, asset_type: Optional[str] = None, sec_api_key: Optional[str] = None) -> bool:
     """Verify if a ticker symbol exists and returns valid market data using yfinance.
 
     Args:
         symbol (str): Ticker or fund symbol (e.g. 'AAPL', 'PTT.BK', 'ONE-UGG-RA').
         asset_type (str, optional): 'US_STOCK', 'TH_STOCK', or 'TH_MUTUAL_FUND'.
+        sec_api_key (str, optional): SEC Thailand API Key.
 
     Returns:
         bool: True if symbol is valid and active on market exchanges, False otherwise.
     """
-    res = validate_symbol_detailed(symbol=symbol, asset_type=asset_type)
+    res = validate_symbol_detailed(symbol=symbol, asset_type=asset_type, sec_api_key=sec_api_key)
     return bool(res.get("valid", False))
+
+
+def validate_symbol_detailed(
+    symbol: str,
+    asset_type: Optional[str] = None,
+    sec_api_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Check if a stock ticker or mutual fund code exists and returns detailed market status.
+
+    Args:
+        symbol (str): Ticker symbol or fund code.
+        asset_type (str, optional): 'US_STOCK', 'TH_STOCK', or 'TH_MUTUAL_FUND'.
+        sec_api_key (str, optional): SEC Thailand API subscription key.
+
+    Returns:
+        Dict[str, Any]: Validation result containing:
+            - valid (bool): True if market data or registry entry found
+            - symbol (str): Normalized symbol
+            - name (str): Asset name
+            - price (float): Current price / NAV
+            - currency (str): Trading currency
+            - asset_type (str): Inferred or validated asset type
+            - message (str): Status description
+            - error (str): Error message if invalid
+    """
+    if not symbol or not isinstance(symbol, str) or not symbol.strip():
+        return {
+            "valid": False,
+            "symbol": "",
+            "name": "",
+            "price": None,
+            "currency": "",
+            "asset_type": asset_type or "",
+            "message": "Symbol cannot be empty.",
+            "error": "Symbol cannot be empty.",
+        }
+
+    norm_sym = symbol.strip().upper()
+    norm_type = asset_type.strip().upper() if asset_type else None
+
+    # Case 1: Thai Mutual Fund
+    if norm_type == "TH_MUTUAL_FUND":
+        fund_data = get_thai_fund_nav(norm_sym, sec_api_key=sec_api_key)
+        if fund_data.get("success") and fund_data.get("nav") is not None and fund_data.get("nav") > 0:
+            return {
+                "valid": True,
+                "symbol": norm_sym,
+                "name": fund_data.get("fund_name", norm_sym),
+                "price": fund_data.get("nav"),
+                "currency": "THB",
+                "asset_type": "TH_MUTUAL_FUND",
+                "message": "Valid Thai Mutual Fund.",
+                "error": None,
+            }
+        return {
+            "valid": False,
+            "symbol": norm_sym,
+            "name": "",
+            "price": None,
+            "currency": "THB",
+            "asset_type": "TH_MUTUAL_FUND",
+            "message": fund_data.get("error", f"Could not find valid NAV for '{norm_sym}'."),
+            "error": fund_data.get("error", f"Could not find valid NAV for '{norm_sym}'."),
+        }
+
+    # Case 2: Stock (US or Thai)
+    target_ticker = norm_sym
+    if norm_type == "TH_STOCK" and not norm_sym.endswith(".BK"):
+        target_ticker = f"{norm_sym}.BK"
+
+    stock_data = get_stock_price(target_ticker)
+    if stock_data.get("success") and stock_data.get("current_price") is not None and stock_data.get("current_price") > 0:
+        inferred_type = "TH_STOCK" if target_ticker.endswith(".BK") else "US_STOCK"
+        return {
+            "valid": True,
+            "symbol": stock_data.get("ticker", target_ticker),
+            "name": stock_data.get("name", target_ticker),
+            "price": stock_data.get("current_price"),
+            "currency": stock_data.get("currency", "USD" if inferred_type == "US_STOCK" else "THB"),
+            "asset_type": inferred_type,
+            "message": "Valid stock ticker.",
+            "error": None,
+        }
+
+    # If not explicitly typed, try fund fallback
+    if norm_type is None:
+        fund_data = get_thai_fund_nav(norm_sym, sec_api_key=sec_api_key)
+        if fund_data.get("success") and fund_data.get("nav") is not None and fund_data.get("nav") > 0:
+            return {
+                "valid": True,
+                "symbol": norm_sym,
+                "name": fund_data.get("fund_name", norm_sym),
+                "price": fund_data.get("nav"),
+                "currency": "THB",
+                "asset_type": "TH_MUTUAL_FUND",
+                "message": "Valid Thai Mutual Fund.",
+                "error": None,
+            }
+
+    return {
+        "valid": False,
+        "symbol": norm_sym,
+        "name": "",
+        "price": None,
+        "currency": "",
+        "asset_type": norm_type or "",
+        "message": stock_data.get("error") or f"Ticker symbol '{norm_sym}' not found.",
+        "error": stock_data.get("error") or f"Ticker symbol '{norm_sym}' not found.",
+    }
 
 
 
