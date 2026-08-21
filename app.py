@@ -846,18 +846,27 @@ else:
         if holdings:
             display_holdings = []
             for h in holdings:
-                curr_sym = "$" if h["currency"] == "USD" else "฿"
+                curr_sym = "$" if h.get("currency") == "USD" else "฿"
+                qty_val = h.get("quantity") if h.get("quantity") is not None else h.get("total_quantity", 0.0)
+                avg_cost_val = h.get("avg_cost_per_share", 0.0)
+                curr_price_val = h.get("current_price", 0.0)
+                cost_basis_val = h.get("cost_basis_thb") if h.get("cost_basis_thb") is not None else h.get("total_cost_thb", 0.0)
+                mkt_val = h.get("market_value_thb", 0.0)
+                pnl_val = h.get("unrealized_pnl_thb", 0.0)
+                return_pct = h.get("unrealized_pnl_percent", 0.0)
+                weight_pct = h.get("weight_percent", 0.0)
+
                 display_holdings.append({
-                    "Symbol": h["symbol"],
-                    "Asset Type": h["asset_type"],
-                    "Units": h["total_quantity"],
-                    "Avg Cost": f"{curr_sym}{h['avg_cost_per_share']:,.2f}",
-                    "Current Price": f"{curr_sym}{h['current_price']:,.2f}",
-                    "Cost Basis (THB)": h["total_cost_thb"],
-                    "Market Value (THB)": h["market_value_thb"],
-                    "P&L (THB)": h["unrealized_pnl_thb"],
-                    "Return %": h["unrealized_pnl_percent"],
-                    "Weight %": h["weight_percent"],
+                    "Symbol": h.get("symbol", ""),
+                    "Asset Type": h.get("asset_type", ""),
+                    "Units": qty_val,
+                    "Avg Cost": f"{curr_sym}{avg_cost_val:,.2f}",
+                    "Current Price": f"{curr_sym}{curr_price_val:,.2f}",
+                    "Cost Basis (THB)": cost_basis_val,
+                    "Market Value (THB)": mkt_val,
+                    "P&L (THB)": pnl_val,
+                    "Return %": return_pct,
+                    "Weight %": weight_pct,
                 })
 
             df_display = pd.DataFrame(display_holdings)
