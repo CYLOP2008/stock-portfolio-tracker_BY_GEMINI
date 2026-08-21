@@ -2,37 +2,35 @@
 database.py
 ===========
 SQLAlchemy Database Management Module for Stock & Fund Portfolio Tracker.
-Connects to Supabase PostgreSQL or local SQLite.
+Supports PostgreSQL (Supabase) and local SQLite with multi-user authentication
+and multi-portfolio management.
 
-Requirements:
-1. Reads DATABASE_URL from st.secrets["DATABASE_URL"] with fallback to os.getenv("DATABASE_URL").
-2. Database engine created using sqlalchemy.create_engine().
-3. Schema:
-   - id (SERIAL PRIMARY KEY)
-   - symbol (VARCHAR(20))
-   - asset_type (VARCHAR(20))
-   - quantity (NUMERIC)
-   - cost_per_share (NUMERIC)
-   - currency (VARCHAR(10))
-   - purchase_date (DATE)
-   - created_at (TIMESTAMP DEFAULT CURRENT_TIMESTAMP)
-4. CRUD Functions:
-   - init_db(): Automatically create the transactions table if it doesn't exist.
-   - add_transaction(symbol, asset_type, quantity, cost_per_share, currency, purchase_date): Insert a new transaction.
-   - delete_transaction(transaction_id): Remove a transaction by ID.
-   - get_all_transactions(): Fetch all transactions and return as a Pandas DataFrame.
+Key Features:
+1. Multi-User Authentication:
+   - User registration & login with secure PBKDF2-HMAC-SHA256 salted password hashing.
+   - Automatic provisioning of a default 'Main Portfolio' upon registration.
+2. Multi-Portfolio Architecture:
+   - Users can create, switch, rename, and delete multiple distinct portfolios.
+   - Transactions are scoped to individual portfolios.
+3. Robust Connection Management:
+   - Reads DATABASE_URL from st.secrets or environment variables with fallback to SQLite.
+   - Automated schema migrations for SQLite and PostgreSQL.
 """
 
 from collections import defaultdict
 from datetime import datetime, date
+import hashlib
+import hmac
 import logging
 import os
-from typing import Any, Dict, List, Optional, Union
+import secrets
+from typing import Any, Dict, List, Optional, Tuple, Union
 import pandas as pd
 from sqlalchemy import (
     Column,
     Date,
     DateTime,
+    ForeignKey,
     Index,
     Integer,
     Numeric,
@@ -43,7 +41,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session
 
 # Configure module logger
 logger = logging.getLogger("portfolio_database")
@@ -69,33 +67,144 @@ VALID_CURRENCIES = {"USD", "THB"}
 Base = declarative_base()
 
 
+# ==============================================================================
+# EXCEPTIONS
+# ==============================================================================
+
 class DatabaseError(Exception):
     """Base exception for database operations."""
     pass
 
 
 class ValidationError(ValueError):
-    """Exception raised for invalid transaction inputs."""
+    """Exception raised for invalid transaction or input validation."""
     pass
 
 
-class Transaction(Base):
-    """SQLAlchemy ORM Model representing a financial portfolio transaction.
+class AuthenticationError(Exception):
+    """Exception raised for authentication and registration failures."""
+    pass
 
-    Schema:
-        - id: SERIAL PRIMARY KEY
-        - symbol: VARCHAR(20)
-        - asset_type: VARCHAR(20)
-        - quantity: NUMERIC
-        - cost_per_share: NUMERIC
-        - currency: VARCHAR(10)
-        - purchase_date: DATE
-        - created_at: TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+
+# ==============================================================================
+# PASSWORD SECURITY & HASHING (PBKDF2-HMAC-SHA256)
+# ==============================================================================
+
+def hash_password(password: str) -> str:
+    """Hash a plaintext password using PBKDF2-HMAC-SHA256 with a cryptographically secure random salt.
+
+    Args:
+        password (str): Plaintext password to hash.
+
+    Returns:
+        str: Salted password hash in format 'salt$iterations$hash_hex'.
     """
+    if not password or not isinstance(password, str):
+        raise ValidationError("Password must be a non-empty string.")
+
+    salt = secrets.token_hex(16)
+    iterations = 100000
+    derived = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        iterations,
+    )
+    return f"{salt}${iterations}${derived.hex()}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    """Verify a plaintext password against a stored salted hash using constant-time comparison.
+
+    Args:
+        password (str): Plaintext password to verify.
+        stored_hash (str): Salted password hash from database.
+
+    Returns:
+        bool: True if password matches, False otherwise.
+    """
+    if not password or not stored_hash or "$" not in stored_hash:
+        return False
+
+    try:
+        parts = stored_hash.split("$")
+        if len(parts) != 3:
+            return False
+        salt, iterations_str, hash_hex = parts
+        iterations = int(iterations_str)
+
+        derived = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt.encode("utf-8"),
+            iterations,
+        )
+        return hmac.compare_digest(derived.hex(), hash_hex)
+    except Exception:
+        return False
+
+
+# ==============================================================================
+# SQLALCHEMY ORM DATA MODELS
+# ==============================================================================
+
+class User(Base):
+    """SQLAlchemy ORM Model representing an application user."""
+
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(String(50), unique=True, nullable=False, index=True)
+    email = Column(String(120), unique=True, nullable=False, index=True)
+    password_hash = Column(String(256), nullable=False)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+    # Relationships
+    portfolios = relationship("Portfolio", back_populates="user", cascade="all, delete-orphan")
+    transactions = relationship("Transaction", back_populates="user", cascade="all, delete-orphan")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "username": self.username,
+            "email": self.email,
+            "created_at": str(self.created_at) if self.created_at else None,
+        }
+
+
+class Portfolio(Base):
+    """SQLAlchemy ORM Model representing a user's portfolio container."""
+
+    __tablename__ = "portfolios"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String(100), nullable=False)
+    description = Column(String(255), nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+    # Relationships
+    user = relationship("User", back_populates="portfolios")
+    transactions = relationship("Transaction", back_populates="portfolio", cascade="all, delete-orphan")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "name": self.name,
+            "description": self.description or "",
+            "created_at": str(self.created_at) if self.created_at else None,
+        }
+
+
+class Transaction(Base):
+    """SQLAlchemy ORM Model representing a financial transaction."""
 
     __tablename__ = "transactions"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    portfolio_id = Column(Integer, ForeignKey("portfolios.id", ondelete="CASCADE"), nullable=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
     symbol = Column(String(20), nullable=False, index=True)
     asset_type = Column(String(20), nullable=False, index=True)
     quantity = Column(Numeric(18, 8), nullable=False)
@@ -104,14 +213,21 @@ class Transaction(Base):
     purchase_date = Column(Date, nullable=False, index=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
 
+    # Relationships
+    portfolio = relationship("Portfolio", back_populates="transactions")
+    user = relationship("User", back_populates="transactions")
+
     __table_args__ = (
         Index("idx_tx_symbol_asset", "symbol", "asset_type"),
+        Index("idx_tx_portfolio_symbol", "portfolio_id", "symbol"),
     )
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert ORM model instance to dictionary."""
         return {
             "id": self.id,
+            "portfolio_id": self.portfolio_id,
+            "user_id": self.user_id,
             "symbol": self.symbol,
             "asset_type": self.asset_type,
             "quantity": float(self.quantity) if self.quantity is not None else 0.0,
@@ -122,25 +238,17 @@ class Transaction(Base):
         }
 
 
-# Global engine cache to manage connection pools
+# ==============================================================================
+# DATABASE CONNECTION MANAGEMENT
+# ==============================================================================
+
 _ENGINE_CACHE: Dict[str, Engine] = {}
 
 
 def get_database_url(db_url: Optional[str] = None) -> str:
-    """Read DATABASE_URL from st.secrets['DATABASE_URL'] with fallback to os.getenv('DATABASE_URL').
-
-    Normalizes 'postgres://' to 'postgresql+psycopg2://' for Supabase compatibility.
-    Falls back to local SQLite ('sqlite:///portfolio.db') if no URL or placeholder is provided.
-
-    Args:
-        db_url (str, optional): Explicit database URL or file path.
-
-    Returns:
-        str: Fully qualified SQLAlchemy connection URL.
-    """
+    """Resolve database URL from st.secrets, environment variables, or local fallback."""
     resolved_url = db_url
 
-    # Helper to check if a URL contains unpopulated template placeholders
     def is_placeholder(u: str) -> bool:
         if not u or not isinstance(u, str):
             return True
@@ -180,7 +288,7 @@ def get_database_url(db_url: Optional[str] = None) -> str:
         else:
             resolved_url = f"sqlite:///{resolved_url}"
 
-    # Supabase & Heroku compatibility: convert postgres:// to postgresql+psycopg2://
+    # Supabase compatibility: convert postgres:// to postgresql+psycopg2://
     if resolved_url.startswith("postgres://"):
         resolved_url = resolved_url.replace("postgres://", "postgresql+psycopg2://", 1)
     elif resolved_url.startswith("postgresql://") and "+psycopg2" not in resolved_url:
@@ -190,14 +298,7 @@ def get_database_url(db_url: Optional[str] = None) -> str:
 
 
 def get_engine(db_url: Optional[str] = None) -> Engine:
-    """Create and return a configured SQLAlchemy Engine.
-
-    Args:
-        db_url (str, optional): Database connection URL.
-
-    Returns:
-        Engine: SQLAlchemy Engine.
-    """
+    """Create and return a configured SQLAlchemy Engine."""
     url = get_database_url(db_url)
 
     if url not in _ENGINE_CACHE:
@@ -205,7 +306,6 @@ def get_engine(db_url: Optional[str] = None) -> Engine:
         if url.startswith("sqlite"):
             engine_args["connect_args"] = {"check_same_thread": False}
         else:
-            # Pool configuration for PostgreSQL / Supabase
             engine_args["pool_size"] = 5
             engine_args["max_overflow"] = 10
             engine_args["pool_pre_ping"] = True
@@ -237,39 +337,35 @@ def get_connection(db_path: str = DEFAULT_DB_PATH):
 
 
 def get_session(db_url: Optional[str] = None) -> Session:
-    """Create and return a new SQLAlchemy Session.
-
-    Args:
-        db_url (str, optional): Database connection URL.
-
-    Returns:
-        Session: Configured SQLAlchemy Session.
-    """
+    """Create and return a new SQLAlchemy Session."""
     engine = get_engine(db_url)
     session_factory = sessionmaker(bind=engine, expire_on_commit=False)
     return session_factory()
 
 
 def init_db(db_url: Optional[str] = None) -> None:
-    """Automatically create the transactions table if it doesn't exist.
-
-    Args:
-        db_url (str, optional): Target database connection URL.
-    """
+    """Automatically create all tables and apply necessary migrations."""
     try:
         engine = get_engine(db_url)
         Base.metadata.create_all(bind=engine)
 
-        # Migration helper: ensure created_at column exists if table was created previously
+        # Migration helpers: ensure newly added columns exist in older database tables
         try:
             with engine.begin() as conn:
                 if engine.dialect.name == "sqlite":
-                    cols = [row[1] for row in conn.execute(text("PRAGMA table_info(transactions)")).fetchall()]
-                    if cols and "created_at" not in cols:
-                        conn.execute(text("ALTER TABLE transactions ADD COLUMN created_at TIMESTAMP"))
-                        conn.execute(text("UPDATE transactions SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"))
+                    tx_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(transactions)")).fetchall()]
+                    if tx_cols:
+                        if "created_at" not in tx_cols:
+                            conn.execute(text("ALTER TABLE transactions ADD COLUMN created_at TIMESTAMP"))
+                            conn.execute(text("UPDATE transactions SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"))
+                        if "portfolio_id" not in tx_cols:
+                            conn.execute(text("ALTER TABLE transactions ADD COLUMN portfolio_id INTEGER"))
+                        if "user_id" not in tx_cols:
+                            conn.execute(text("ALTER TABLE transactions ADD COLUMN user_id INTEGER"))
                 elif engine.dialect.name == "postgresql":
                     conn.execute(text("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"))
+                    conn.execute(text("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS portfolio_id INTEGER REFERENCES portfolios(id) ON DELETE CASCADE"))
+                    conn.execute(text("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id) ON DELETE CASCADE"))
         except Exception:
             pass
 
@@ -278,6 +374,327 @@ def init_db(db_url: Optional[str] = None) -> None:
         logger.error(f"Error initializing database schema: {e}")
         raise DatabaseError(f"Database schema initialization failed: {e}") from e
 
+
+# ==============================================================================
+# MULTI-USER AUTHENTICATION FUNCTIONS
+# ==============================================================================
+
+def register_user(
+    username: str,
+    email: str,
+    password: str,
+    db_path: Optional[str] = None,
+    db_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Register a new user and automatically create their default 'Main Portfolio'.
+
+    Args:
+        username (str): Unique username (3-50 chars).
+        email (str): Unique email address.
+        password (str): Plaintext password (min 6 chars).
+        db_path / db_url: Database connection target.
+
+    Returns:
+        Dict[str, Any]: Created user record with default portfolio info.
+    """
+    target_url = db_url or db_path
+    init_db(target_url)
+
+    # 1. Validation
+    if not username or not isinstance(username, str) or len(username.strip()) < 3:
+        raise ValidationError("Username must be at least 3 characters long.")
+    norm_username = username.strip()
+
+    if not email or not isinstance(email, str) or "@" not in email:
+        raise ValidationError("Please provide a valid email address.")
+    norm_email = email.strip().lower()
+
+    if not password or not isinstance(password, str) or len(password) < 6:
+        raise ValidationError("Password must be at least 6 characters long.")
+
+    session = get_session(target_url)
+    try:
+        # Check if username or email already exists
+        existing_user = session.scalars(
+            select(User).where((User.username == norm_username) | (User.email == norm_email))
+        ).first()
+
+        if existing_user:
+            if existing_user.username.lower() == norm_username.lower():
+                raise AuthenticationError(f"Username '{norm_username}' is already taken.")
+            raise AuthenticationError(f"Email '{norm_email}' is already registered.")
+
+        # Create new user
+        hashed_pwd = hash_password(password)
+        new_user = User(
+            username=norm_username,
+            email=norm_email,
+            password_hash=hashed_pwd,
+        )
+        session.add(new_user)
+        session.commit()
+        session.refresh(new_user)
+
+        # Automatically create default 'Main Portfolio'
+        default_portfolio = Portfolio(
+            user_id=new_user.id,
+            name="Main Portfolio",
+            description="Default multi-asset portfolio",
+        )
+        session.add(default_portfolio)
+        session.commit()
+        session.refresh(default_portfolio)
+
+        user_data = new_user.to_dict()
+        user_data["default_portfolio_id"] = default_portfolio.id
+        logger.info(f"Registered user '{norm_username}' with default portfolio #{default_portfolio.id}.")
+        return user_data
+    except (ValidationError, AuthenticationError):
+        session.rollback()
+        raise
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Failed to register user '{username}': {e}")
+        raise DatabaseError(f"User registration error: {e}") from e
+    finally:
+        session.close()
+
+
+def authenticate_user(
+    username_or_email: str,
+    password: str,
+    db_path: Optional[str] = None,
+    db_url: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Authenticate a user by username or email and password.
+
+    Args:
+        username_or_email (str): Username or email.
+        password (str): Plaintext password.
+
+    Returns:
+        Optional[Dict[str, Any]]: User profile dict if valid, None otherwise.
+    """
+    if not username_or_email or not password:
+        return None
+
+    target_url = db_url or db_path
+    init_db(target_url)
+    identifier = username_or_email.strip()
+
+    session = get_session(target_url)
+    try:
+        user = session.scalars(
+            select(User).where((User.username == identifier) | (User.email == identifier.lower()))
+        ).first()
+
+        if not user:
+            return None
+
+        if verify_password(password, user.password_hash):
+            logger.info(f"User '{user.username}' authenticated successfully.")
+            return user.to_dict()
+        return None
+    except Exception as e:
+        logger.error(f"Authentication error: {e}")
+        raise DatabaseError(f"Authentication error: {e}") from e
+    finally:
+        session.close()
+
+
+def get_user_by_id(
+    user_id: int,
+    db_path: Optional[str] = None,
+    db_url: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Fetch user profile by primary key ID."""
+    target_url = db_url or db_path
+    init_db(target_url)
+
+    session = get_session(target_url)
+    try:
+        user = session.get(User, user_id)
+        return user.to_dict() if user else None
+    finally:
+        session.close()
+
+
+# ==============================================================================
+# MULTI-PORTFOLIO MANAGEMENT FUNCTIONS
+# ==============================================================================
+
+def create_portfolio(
+    user_id: int,
+    name: str,
+    description: Optional[str] = None,
+    db_path: Optional[str] = None,
+    db_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create a new portfolio for a specified user."""
+    target_url = db_url or db_path
+    init_db(target_url)
+
+    if not name or not isinstance(name, str) or not name.strip():
+        raise ValidationError("Portfolio name must be a non-empty string.")
+    norm_name = name.strip()
+
+    session = get_session(target_url)
+    try:
+        user = session.get(User, user_id)
+        if not user:
+            raise ValidationError(f"User #{user_id} not found.")
+
+        new_pf = Portfolio(
+            user_id=user_id,
+            name=norm_name,
+            description=description.strip() if description else None,
+        )
+        session.add(new_pf)
+        session.commit()
+        session.refresh(new_pf)
+        logger.info(f"Created portfolio #{new_pf.id} ('{norm_name}') for user #{user_id}.")
+        return new_pf.to_dict()
+    except ValidationError:
+        session.rollback()
+        raise
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Failed to create portfolio '{name}': {e}")
+        raise DatabaseError(f"Portfolio creation error: {e}") from e
+    finally:
+        session.close()
+
+
+def get_user_portfolios(
+    user_id: int,
+    db_path: Optional[str] = None,
+    db_url: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Retrieve all portfolios owned by a specific user."""
+    target_url = db_url or db_path
+    init_db(target_url)
+
+    session = get_session(target_url)
+    try:
+        stmt = select(Portfolio).where(Portfolio.user_id == user_id).order_by(Portfolio.id.asc())
+        portfolios = session.scalars(stmt).all()
+
+        # If user has no portfolios (e.g. legacy user), automatically create a default one
+        if not portfolios:
+            user = session.get(User, user_id)
+            if user:
+                default_pf = Portfolio(
+                    user_id=user_id,
+                    name="Main Portfolio",
+                    description="Default portfolio",
+                )
+                session.add(default_pf)
+                session.commit()
+                session.refresh(default_pf)
+                return [default_pf.to_dict()]
+
+        return [pf.to_dict() for pf in portfolios]
+    except Exception as e:
+        logger.error(f"Failed to retrieve portfolios for user #{user_id}: {e}")
+        raise DatabaseError(f"Portfolio retrieval error: {e}") from e
+    finally:
+        session.close()
+
+
+def get_portfolio_by_id(
+    portfolio_id: int,
+    user_id: Optional[int] = None,
+    db_path: Optional[str] = None,
+    db_url: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Get a portfolio by ID, optionally verifying ownership by user_id."""
+    target_url = db_url or db_path
+    init_db(target_url)
+
+    session = get_session(target_url)
+    try:
+        pf = session.get(Portfolio, portfolio_id)
+        if not pf:
+            return None
+        if user_id is not None and pf.user_id != user_id:
+            return None
+        return pf.to_dict()
+    finally:
+        session.close()
+
+
+def update_portfolio(
+    portfolio_id: int,
+    user_id: int,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+    db_path: Optional[str] = None,
+    db_url: Optional[str] = None,
+) -> bool:
+    """Update name or description of an existing portfolio owned by the user."""
+    target_url = db_url or db_path
+    init_db(target_url)
+
+    session = get_session(target_url)
+    try:
+        pf = session.get(Portfolio, portfolio_id)
+        if not pf or pf.user_id != user_id:
+            logger.warning(f"Portfolio #{portfolio_id} not found or not owned by user #{user_id}.")
+            return False
+
+        if name is not None:
+            if not name.strip():
+                raise ValidationError("Portfolio name cannot be empty.")
+            pf.name = name.strip()
+        if description is not None:
+            pf.description = description.strip()
+
+        session.commit()
+        logger.info(f"Updated portfolio #{portfolio_id}.")
+        return True
+    except ValidationError:
+        session.rollback()
+        raise
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Failed to update portfolio #{portfolio_id}: {e}")
+        raise DatabaseError(f"Portfolio update error: {e}") from e
+    finally:
+        session.close()
+
+
+def delete_portfolio(
+    portfolio_id: int,
+    user_id: int,
+    db_path: Optional[str] = None,
+    db_url: Optional[str] = None,
+) -> bool:
+    """Delete a portfolio and all its associated transactions."""
+    target_url = db_url or db_path
+    init_db(target_url)
+
+    session = get_session(target_url)
+    try:
+        pf = session.get(Portfolio, portfolio_id)
+        if not pf or pf.user_id != user_id:
+            logger.warning(f"Portfolio #{portfolio_id} not found or not owned by user #{user_id}.")
+            return False
+
+        session.delete(pf)
+        session.commit()
+        logger.info(f"Deleted portfolio #{portfolio_id} for user #{user_id}.")
+        return True
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Failed to delete portfolio #{portfolio_id}: {e}")
+        raise DatabaseError(f"Portfolio delete error: {e}") from e
+    finally:
+        session.close()
+
+
+# ==============================================================================
+# TRANSACTION VALIDATION & CRUD FUNCTIONS
+# ==============================================================================
 
 def _validate_and_normalize_inputs(
     symbol: str,
@@ -364,24 +781,12 @@ def add_transaction(
     cost_per_share: Union[int, float],
     currency: Optional[str] = None,
     purchase_date: Optional[Union[str, date]] = None,
+    portfolio_id: Optional[int] = None,
+    user_id: Optional[int] = None,
     db_path: Optional[str] = None,
     db_url: Optional[str] = None,
 ) -> int:
-    """Insert a new transaction into the PostgreSQL / SQLite database.
-
-    Args:
-        symbol (str): Ticker symbol (e.g. 'AAPL', 'PTT.BK', 'SCBDV').
-        asset_type (str): 'US_STOCK', 'TH_STOCK', or 'TH_MUTUAL_FUND'.
-        quantity (float): Number of units / shares purchased (> 0).
-        cost_per_share (float): Purchase price per unit / share (>= 0).
-        currency (str, optional): 'USD' or 'THB'. Auto-inferred if not provided.
-        purchase_date (str | date, optional): Purchase date. Defaults to today.
-        db_path (str, optional): Alias for db_url.
-        db_url (str, optional): Target database connection URL.
-
-    Returns:
-        int: The primary key ID of the newly inserted transaction.
-    """
+    """Insert a new transaction into the PostgreSQL / SQLite database."""
     target_url = db_url or db_path
     init_db(target_url)
 
@@ -397,6 +802,8 @@ def add_transaction(
     session = get_session(target_url)
     try:
         new_tx = Transaction(
+            portfolio_id=portfolio_id,
+            user_id=user_id,
             symbol=clean_params["symbol"],
             asset_type=clean_params["asset_type"],
             quantity=clean_params["quantity"],
@@ -408,7 +815,7 @@ def add_transaction(
         session.commit()
         session.refresh(new_tx)
         new_id = int(new_tx.id)
-        logger.info(f"Added transaction #{new_id} for symbol '{clean_params['symbol']}'.")
+        logger.info(f"Added transaction #{new_id} for symbol '{clean_params['symbol']}' in portfolio #{portfolio_id}.")
         return new_id
     except Exception as e:
         session.rollback()
@@ -420,33 +827,34 @@ def add_transaction(
 
 def delete_transaction(
     transaction_id: int,
+    portfolio_id: Optional[int] = None,
+    user_id: Optional[int] = None,
     db_path: Optional[str] = None,
     db_url: Optional[str] = None,
 ) -> bool:
-    """Remove a transaction by ID.
-
-    Args:
-        transaction_id (int): Transaction ID to delete.
-        db_path (str, optional): Alias for db_url.
-        db_url (str, optional): Target database connection URL.
-
-    Returns:
-        bool: True if a record was found and deleted, False otherwise.
-    """
+    """Remove a transaction by ID, optionally verifying portfolio_id or user_id."""
     target_url = db_url or db_path
     init_db(target_url)
 
     session = get_session(target_url)
     try:
         tx = session.get(Transaction, transaction_id)
-        if tx:
-            session.delete(tx)
-            session.commit()
-            logger.info(f"Deleted transaction #{transaction_id}.")
-            return True
-        else:
+        if not tx:
             logger.warning(f"Transaction #{transaction_id} not found for deletion.")
             return False
+
+        if portfolio_id is not None and tx.portfolio_id is not None and tx.portfolio_id != portfolio_id:
+            logger.warning(f"Transaction #{transaction_id} does not belong to portfolio #{portfolio_id}.")
+            return False
+
+        if user_id is not None and tx.user_id is not None and tx.user_id != user_id:
+            logger.warning(f"Transaction #{transaction_id} does not belong to user #{user_id}.")
+            return False
+
+        session.delete(tx)
+        session.commit()
+        logger.info(f"Deleted transaction #{transaction_id}.")
+        return True
     except Exception as e:
         session.rollback()
         logger.error(f"Failed to delete transaction #{transaction_id}: {e}")
@@ -456,33 +864,39 @@ def delete_transaction(
 
 
 def get_all_transactions(
+    portfolio_id: Optional[Union[int, str]] = None,
+    user_id: Optional[int] = None,
     db_path: Optional[str] = None,
     db_url: Optional[str] = None,
     as_dataframe: bool = True,
 ) -> Union[pd.DataFrame, List[Dict[str, Any]]]:
-    """Fetch all transactions and return as a Pandas DataFrame by default.
+    """Fetch all transactions scoped by portfolio_id or user_id, returning pd.DataFrame by default."""
+    actual_pf_id = portfolio_id
+    if isinstance(portfolio_id, str) and ("/" in portfolio_id or portfolio_id.endswith(".db") or "sqlite" in portfolio_id or "postgres" in portfolio_id):
+        target_url = portfolio_id
+        actual_pf_id = None
+    else:
+        target_url = db_url or db_path
 
-    Args:
-        db_path (str, optional): Alias for db_url.
-        db_url (str, optional): Database connection URL.
-        as_dataframe (bool): If True, returns a pd.DataFrame (default). If False, returns List[Dict].
-
-    Returns:
-        pd.DataFrame or List[Dict[str, Any]]: Collection of all transaction records.
-    """
-    target_url = db_url or db_path
     init_db(target_url)
 
     session = get_session(target_url)
     try:
-        stmt = select(Transaction).order_by(Transaction.purchase_date.asc(), Transaction.id.asc())
+        stmt = select(Transaction)
+        if actual_pf_id is not None:
+            stmt = stmt.where(Transaction.portfolio_id == int(actual_pf_id))
+        elif user_id is not None:
+            stmt = stmt.where(Transaction.user_id == user_id)
+
+        stmt = stmt.order_by(Transaction.purchase_date.asc(), Transaction.id.asc())
         results = session.scalars(stmt).all()
         records = [tx.to_dict() for tx in results]
 
         if as_dataframe:
             if not records:
                 return pd.DataFrame(columns=[
-                    "id", "symbol", "asset_type", "quantity", "cost_per_share", "currency", "purchase_date", "created_at"
+                    "id", "portfolio_id", "user_id", "symbol", "asset_type", "quantity",
+                    "cost_per_share", "currency", "purchase_date", "created_at"
                 ])
             return pd.DataFrame(records)
         return records
@@ -494,11 +908,13 @@ def get_all_transactions(
 
 
 def fetch_all_transactions(
+    portfolio_id: Optional[int] = None,
+    user_id: Optional[int] = None,
     db_path: Optional[str] = None,
     db_url: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Retrieve all transactions formatted as a Python list of dictionaries."""
-    return get_all_transactions(db_path=db_path, db_url=db_url, as_dataframe=False)
+    return get_all_transactions(portfolio_id=portfolio_id, user_id=user_id, db_path=db_path, db_url=db_url, as_dataframe=False)
 
 
 def get_transaction_by_id(
@@ -523,6 +939,7 @@ def get_transaction_by_id(
 
 def get_transactions_by_symbol(
     symbol: str,
+    portfolio_id: Optional[int] = None,
     db_path: Optional[str] = None,
     db_url: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
@@ -533,11 +950,10 @@ def get_transactions_by_symbol(
 
     session = get_session(target_url)
     try:
-        stmt = (
-            select(Transaction)
-            .where(Transaction.symbol == norm_symbol)
-            .order_by(Transaction.purchase_date.asc(), Transaction.id.asc())
-        )
+        stmt = select(Transaction).where(Transaction.symbol == norm_symbol)
+        if portfolio_id is not None:
+            stmt = stmt.where(Transaction.portfolio_id == portfolio_id)
+        stmt = stmt.order_by(Transaction.purchase_date.asc(), Transaction.id.asc())
         results = session.scalars(stmt).all()
         return [tx.to_dict() for tx in results]
     except Exception as e:
@@ -549,6 +965,7 @@ def get_transactions_by_symbol(
 
 def get_transactions_by_asset_type(
     asset_type: str,
+    portfolio_id: Optional[int] = None,
     db_path: Optional[str] = None,
     db_url: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
@@ -559,11 +976,10 @@ def get_transactions_by_asset_type(
 
     session = get_session(target_url)
     try:
-        stmt = (
-            select(Transaction)
-            .where(Transaction.asset_type == norm_type)
-            .order_by(Transaction.purchase_date.asc(), Transaction.id.asc())
-        )
+        stmt = select(Transaction).where(Transaction.asset_type == norm_type)
+        if portfolio_id is not None:
+            stmt = stmt.where(Transaction.portfolio_id == portfolio_id)
+        stmt = stmt.order_by(Transaction.purchase_date.asc(), Transaction.id.asc())
         results = session.scalars(stmt).all()
         return [tx.to_dict() for tx in results]
     except Exception as e:
@@ -574,11 +990,13 @@ def get_transactions_by_asset_type(
 
 
 def get_portfolio_summary_holdings(
+    portfolio_id: Optional[int] = None,
+    user_id: Optional[int] = None,
     db_path: Optional[str] = None,
     db_url: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Group transactions by symbol to calculate total quantity and average cost basis."""
-    transactions = fetch_all_transactions(db_path=db_path, db_url=db_url)
+    transactions = fetch_all_transactions(portfolio_id=portfolio_id, user_id=user_id, db_path=db_path, db_url=db_url)
     if not transactions:
         return []
 
@@ -619,6 +1037,7 @@ def update_transaction(
     cost_per_share: Optional[Union[int, float]] = None,
     currency: Optional[str] = None,
     purchase_date: Optional[Union[str, date]] = None,
+    portfolio_id: Optional[int] = None,
     db_path: Optional[str] = None,
     db_url: Optional[str] = None,
 ) -> bool:
@@ -655,6 +1074,8 @@ def update_transaction(
         tx.cost_per_share = clean_params["cost_per_share"]
         tx.currency = clean_params["currency"]
         tx.purchase_date = clean_params["purchase_date_obj"]
+        if portfolio_id is not None:
+            tx.portfolio_id = portfolio_id
 
         session.commit()
         logger.info(f"Updated transaction #{transaction_id}.")
@@ -668,22 +1089,35 @@ def update_transaction(
 
 
 def clear_all_transactions(
+    portfolio_id: Optional[Union[int, str]] = None,
+    user_id: Optional[int] = None,
     db_path: Optional[str] = None,
     db_url: Optional[str] = None,
 ) -> int:
-    """Delete all transactions from the database. Useful for resetting test environments."""
-    target_url = db_url or db_path
+    """Delete all transactions from the database or specified portfolio."""
+    actual_pf_id = portfolio_id
+    if isinstance(portfolio_id, str) and ("/" in portfolio_id or portfolio_id.endswith(".db") or "sqlite" in portfolio_id or "postgres" in portfolio_id):
+        target_url = portfolio_id
+        actual_pf_id = None
+    else:
+        target_url = db_url or db_path
+
     init_db(target_url)
 
     session = get_session(target_url)
     try:
         stmt = select(Transaction)
+        if actual_pf_id is not None:
+            stmt = stmt.where(Transaction.portfolio_id == int(actual_pf_id))
+        elif user_id is not None:
+            stmt = stmt.where(Transaction.user_id == user_id)
+
         all_txs = session.scalars(stmt).all()
         count = len(all_txs)
         for tx in all_txs:
             session.delete(tx)
         session.commit()
-        logger.info(f"Cleared all {count} transactions from database.")
+        logger.info(f"Cleared {count} transactions from database/portfolio.")
         return count
     except Exception as e:
         session.rollback()
@@ -693,12 +1127,28 @@ def clear_all_transactions(
         session.close()
 
 
+# ==============================================================================
+# CLASS INTERFACE
+# ==============================================================================
+
 class PortfolioDB:
     """Object-oriented wrapper around SQLAlchemy database operations."""
 
     def __init__(self, db_url: Optional[str] = None, db_path: Optional[str] = None):
         self.db_url = get_database_url(db_url or db_path)
         init_db(self.db_url)
+
+    def register(self, username: str, email: str, password: str) -> Dict[str, Any]:
+        return register_user(username=username, email=email, password=password, db_url=self.db_url)
+
+    def authenticate(self, username_or_email: str, password: str) -> Optional[Dict[str, Any]]:
+        return authenticate_user(username_or_email=username_or_email, password=password, db_url=self.db_url)
+
+    def create_portfolio(self, user_id: int, name: str, description: Optional[str] = None) -> Dict[str, Any]:
+        return create_portfolio(user_id=user_id, name=name, description=description, db_url=self.db_url)
+
+    def get_portfolios(self, user_id: int) -> List[Dict[str, Any]]:
+        return get_user_portfolios(user_id=user_id, db_url=self.db_url)
 
     def add(
         self,
@@ -708,6 +1158,8 @@ class PortfolioDB:
         cost_per_share: Union[int, float],
         currency: Optional[str] = None,
         purchase_date: Optional[Union[str, date]] = None,
+        portfolio_id: Optional[int] = None,
+        user_id: Optional[int] = None,
     ) -> int:
         return add_transaction(
             symbol=symbol,
@@ -716,23 +1168,25 @@ class PortfolioDB:
             cost_per_share=cost_per_share,
             currency=currency,
             purchase_date=purchase_date,
+            portfolio_id=portfolio_id,
+            user_id=user_id,
             db_url=self.db_url,
         )
 
     def add_transaction(self, *args, **kwargs) -> int:
         return self.add(*args, **kwargs)
 
-    def delete(self, transaction_id: int) -> bool:
-        return delete_transaction(transaction_id, db_url=self.db_url)
+    def delete(self, transaction_id: int, portfolio_id: Optional[int] = None) -> bool:
+        return delete_transaction(transaction_id, portfolio_id=portfolio_id, db_url=self.db_url)
 
-    def delete_transaction(self, transaction_id: int) -> bool:
-        return self.delete(transaction_id)
+    def delete_transaction(self, transaction_id: int, *args, **kwargs) -> bool:
+        return self.delete(transaction_id, *args, **kwargs)
 
-    def get_all(self, as_dataframe: bool = False) -> Union[List[Dict[str, Any]], pd.DataFrame]:
-        return get_all_transactions(db_url=self.db_url, as_dataframe=as_dataframe)
+    def get_all(self, portfolio_id: Optional[int] = None, as_dataframe: bool = False) -> Union[List[Dict[str, Any]], pd.DataFrame]:
+        return get_all_transactions(portfolio_id=portfolio_id, db_url=self.db_url, as_dataframe=as_dataframe)
 
-    def get_all_transactions(self, as_dataframe: bool = True) -> Union[pd.DataFrame, List[Dict[str, Any]]]:
-        return get_all_transactions(db_url=self.db_url, as_dataframe=as_dataframe)
+    def get_all_transactions(self, portfolio_id: Optional[int] = None, as_dataframe: bool = True) -> Union[pd.DataFrame, List[Dict[str, Any]]]:
+        return get_all_transactions(portfolio_id=portfolio_id, db_url=self.db_url, as_dataframe=as_dataframe)
 
     def get_by_id(self, transaction_id: int) -> Optional[Dict[str, Any]]:
         return get_transaction_by_id(transaction_id, db_url=self.db_url)
@@ -740,14 +1194,14 @@ class PortfolioDB:
     def get_transaction_by_id(self, transaction_id: int) -> Optional[Dict[str, Any]]:
         return self.get_by_id(transaction_id)
 
-    def get_by_symbol(self, symbol: str) -> List[Dict[str, Any]]:
-        return get_transactions_by_symbol(symbol, db_url=self.db_url)
+    def get_by_symbol(self, symbol: str, portfolio_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        return get_transactions_by_symbol(symbol, portfolio_id=portfolio_id, db_url=self.db_url)
 
-    def get_by_asset_type(self, asset_type: str) -> List[Dict[str, Any]]:
-        return get_transactions_by_asset_type(asset_type, db_url=self.db_url)
+    def get_by_asset_type(self, asset_type: str, portfolio_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        return get_transactions_by_asset_type(asset_type, portfolio_id=portfolio_id, db_url=self.db_url)
 
-    def get_holdings_summary(self) -> List[Dict[str, Any]]:
-        return get_portfolio_summary_holdings(db_url=self.db_url)
+    def get_holdings_summary(self, portfolio_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        return get_portfolio_summary_holdings(portfolio_id=portfolio_id, db_url=self.db_url)
 
     def update(
         self,
@@ -758,6 +1212,7 @@ class PortfolioDB:
         cost_per_share: Optional[Union[int, float]] = None,
         currency: Optional[str] = None,
         purchase_date: Optional[Union[str, date]] = None,
+        portfolio_id: Optional[int] = None,
     ) -> bool:
         return update_transaction(
             transaction_id=transaction_id,
@@ -767,17 +1222,18 @@ class PortfolioDB:
             cost_per_share=cost_per_share,
             currency=currency,
             purchase_date=purchase_date,
+            portfolio_id=portfolio_id,
             db_url=self.db_url,
         )
 
     def update_transaction(self, *args, **kwargs) -> bool:
         return self.update(*args, **kwargs)
 
-    def clear_all(self) -> int:
-        return clear_all_transactions(db_url=self.db_url)
+    def clear_all(self, portfolio_id: Optional[int] = None) -> int:
+        return clear_all_transactions(portfolio_id=portfolio_id, db_url=self.db_url)
 
-    def clear_all_transactions(self) -> int:
-        return self.clear_all()
+    def clear_all_transactions(self, portfolio_id: Optional[int] = None) -> int:
+        return self.clear_all(portfolio_id=portfolio_id)
 
     def __enter__(self):
         return self
