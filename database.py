@@ -209,6 +209,7 @@ def get_engine(db_url: Optional[str] = None) -> Engine:
             engine_args["pool_size"] = 5
             engine_args["max_overflow"] = 10
             engine_args["pool_pre_ping"] = True
+            engine_args["connect_args"] = {"connect_timeout": 10}
 
         _ENGINE_CACHE[url] = create_engine(url, **engine_args)
 

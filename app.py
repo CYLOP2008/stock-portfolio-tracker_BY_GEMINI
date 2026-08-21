@@ -57,8 +57,19 @@ st.set_page_config(
 # ------------------------------------------------------------------------------
 # 2. Database & Schema Initialization on Startup
 # ------------------------------------------------------------------------------
-init_db()
-init_ticker_cache(DEFAULT_DB_PATH)
+db_init_error = None
+try:
+    init_db()
+    init_ticker_cache(DEFAULT_DB_PATH)
+except Exception as e:
+    db_init_error = str(e)
+    # Graceful fallback to SQLite so the application doesn't crash
+    try:
+        from database import DEFAULT_DB_URL
+        init_db(DEFAULT_DB_URL)
+        init_ticker_cache(DEFAULT_DB_PATH)
+    except Exception:
+        pass
 
 # Retrieve sensitive credentials from st.secrets or environment
 SEC_API_KEY = None
@@ -421,6 +432,18 @@ st.markdown(
     '<div class="sub-title">Real-time consolidated tracking for US Stocks, Thai Stocks (.BK), and Thai Mutual Funds in Thai Baht (THB).</div>',
     unsafe_allow_html=True,
 )
+
+if db_init_error:
+    st.warning(
+        "⚠️ **Could not connect to PostgreSQL (Supabase). Currently using temporary local fallback storage.**\n\n"
+        "**To connect your Supabase database in Streamlit Community Cloud:**\n"
+        "1. Go to your **Streamlit App Dashboard** -> Click **Manage app** (bottom-right) -> **App Settings** -> **Secrets**.\n"
+        "2. Add your **Supabase Connection Pooler URI** (IPv4):\n"
+        "   ```toml\n"
+        "   DATABASE_URL = \"postgresql://postgres.[YOUR-PROJECT-REF]:[YOUR-PASSWORD]@aws-0-[REGION].pooler.supabase.com:6543/postgres\"\n"
+        "   ```\n"
+        "3. *Tip: Use port `6543` and ensure special characters in your password (e.g. `@`, `#`, `%`) are URL-encoded.*"
+    )
 
 # Fetch transactions and calculate metrics
 transactions = get_all_transactions(as_dataframe=False)
