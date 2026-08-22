@@ -127,6 +127,22 @@ class TestInputValidation(unittest.TestCase):
         with self.assertRaises(ValidationError):
             _validate_and_normalize_inputs("AAPL", "US_STOCK", 10, 100, "USD", "invalid-date")
 
+    def test_valid_transaction_types(self):
+        res_buy = _validate_and_normalize_inputs("AAPL", "US_STOCK", 10, 100, "USD", "2024-01-01", transaction_type="BUY")
+        self.assertEqual(res_buy["transaction_type"], "BUY")
+
+        res_sell = _validate_and_normalize_inputs("AAPL", "US_STOCK", 5, 120, "USD", "2024-02-01", transaction_type="SELL")
+        self.assertEqual(res_sell["transaction_type"], "SELL")
+
+        res_lower = _validate_and_normalize_inputs("AAPL", "US_STOCK", 5, 120, "USD", "2024-02-01", transaction_type="sell")
+        self.assertEqual(res_lower["transaction_type"], "SELL")
+
+    def test_invalid_transaction_type(self):
+        with self.assertRaises(ValidationError):
+            _validate_and_normalize_inputs("AAPL", "US_STOCK", 10, 100, "USD", "2024-01-01", transaction_type="HOLD")
+        with self.assertRaises(ValidationError):
+            _validate_and_normalize_inputs("AAPL", "US_STOCK", 10, 100, "USD", "2024-01-01", transaction_type="DIVIDEND")
+
 
 class TestDatabaseUrlResolution(unittest.TestCase):
     """Test resolution of PostgreSQL, SQLite, and Supabase connection strings."""
@@ -305,6 +321,7 @@ class TestDatabaseCRUD(unittest.TestCase):
             cost_per_share=150.0,
             currency="USD",
             purchase_date="2024-01-15",
+            transaction_type="BUY",
             db_url=self.db_url,
         )
         self.assertGreater(tx_id, 0)
@@ -314,6 +331,67 @@ class TestDatabaseCRUD(unittest.TestCase):
         self.assertEqual(df.iloc[0]["symbol"], "AAPL")
         self.assertEqual(df.iloc[0]["quantity"], 10.0)
         self.assertEqual(df.iloc[0]["cost_per_share"], 150.0)
+        self.assertEqual(df.iloc[0]["transaction_type"], "BUY")
+
+    def test_add_buy_and_sell_transactions(self):
+        buy_id = add_transaction(
+            symbol="AAPL",
+            asset_type="US_STOCK",
+            quantity=10,
+            cost_per_share=150.0,
+            currency="USD",
+            purchase_date="2024-01-10",
+            transaction_type="BUY",
+            db_url=self.db_url,
+        )
+        sell_id = add_transaction(
+            symbol="AAPL",
+            asset_type="US_STOCK",
+            quantity=4,
+            cost_per_share=180.0,
+            currency="USD",
+            purchase_date="2024-01-20",
+            transaction_type="SELL",
+            db_url=self.db_url,
+        )
+        self.assertGreater(buy_id, 0)
+        self.assertGreater(sell_id, 0)
+
+        txs = get_all_transactions(db_url=self.db_url, as_dataframe=False)
+        self.assertEqual(len(txs), 2)
+        self.assertEqual(txs[0]["transaction_type"], "BUY")
+        self.assertEqual(txs[1]["transaction_type"], "SELL")
+
+    def test_get_all_transactions_chronological_ordering(self):
+        # Insert out of chronological order
+        add_transaction("AAPL", "US_STOCK", 5, 180.0, "USD", "2024-03-01", transaction_type="SELL", db_url=self.db_url)
+        add_transaction("AAPL", "US_STOCK", 10, 150.0, "USD", "2024-01-01", transaction_type="BUY", db_url=self.db_url)
+        add_transaction("AAPL", "US_STOCK", 20, 160.0, "USD", "2024-02-01", transaction_type="BUY", db_url=self.db_url)
+
+        txs = get_all_transactions(db_url=self.db_url, as_dataframe=False)
+        self.assertEqual(len(txs), 3)
+        self.assertEqual(txs[0]["purchase_date"], "2024-01-01")
+        self.assertEqual(txs[0]["transaction_type"], "BUY")
+        self.assertEqual(txs[1]["purchase_date"], "2024-02-01")
+        self.assertEqual(txs[1]["transaction_type"], "BUY")
+        self.assertEqual(txs[2]["purchase_date"], "2024-03-01")
+        self.assertEqual(txs[2]["transaction_type"], "SELL")
+
+    def test_direct_fifo_calculator_ingestion(self):
+        from fifo_calculator import calculate_fifo_portfolio
+
+        add_transaction("AAPL", "US_STOCK", 10, 100.0, "USD", "2024-01-01", transaction_type="BUY", db_url=self.db_url)
+        add_transaction("AAPL", "US_STOCK", 20, 150.0, "USD", "2024-02-01", transaction_type="BUY", db_url=self.db_url)
+        add_transaction("AAPL", "US_STOCK", 15, 200.0, "USD", "2024-03-01", transaction_type="SELL", db_url=self.db_url)
+
+        # Fetch transactions sorted chronologically
+        txs = get_all_transactions(db_url=self.db_url, as_dataframe=False)
+        fifo_res = calculate_fifo_portfolio(txs)
+
+        # Realized PnL: (200-100)*10 + (200-150)*5 = 1250.0
+        self.assertEqual(fifo_res["realized_pnl"]["overall_total"], 1250.0)
+        self.assertEqual(fifo_res["remaining_holdings"]["AAPL"]["total_quantity"], 15.0)
+        self.assertEqual(fifo_res["remaining_holdings"]["AAPL"]["total_cost"], 2250.0)
 
     def test_delete_transaction(self):
         tx_id = add_transaction("AAPL", "US_STOCK", 10, 150.0, "USD", "2024-01-01", db_url=self.db_url)
@@ -325,12 +403,13 @@ class TestDatabaseCRUD(unittest.TestCase):
 
     def test_update_transaction(self):
         tx_id = add_transaction("AAPL", "US_STOCK", 10, 150.0, "USD", "2024-01-01", db_url=self.db_url)
-        success = update_transaction(tx_id, quantity=25, cost_per_share=160.0, db_url=self.db_url)
+        success = update_transaction(tx_id, quantity=25, cost_per_share=160.0, transaction_type="SELL", db_url=self.db_url)
         self.assertTrue(success)
 
         tx = get_transaction_by_id(tx_id, db_url=self.db_url)
         self.assertEqual(tx["quantity"], 25.0)
         self.assertEqual(tx["cost_per_share"], 160.0)
+        self.assertEqual(tx["transaction_type"], "SELL")
 
 
 class TestPortfolioDBClass(unittest.TestCase):
@@ -349,18 +428,20 @@ class TestPortfolioDBClass(unittest.TestCase):
             pass
 
     def test_class_lifecycle_and_methods(self):
-        tx_id = self.db.add("TSLA", "US_STOCK", 10, 200.0, "USD", "2024-01-10")
+        tx_id = self.db.add("TSLA", "US_STOCK", 10, 200.0, "USD", "2024-01-10", transaction_type="BUY")
         self.assertEqual(tx_id, 1)
 
         tx = self.db.get_by_id(tx_id)
         self.assertEqual(tx["symbol"], "TSLA")
+        self.assertEqual(tx["transaction_type"], "BUY")
 
         all_tx = self.db.get_all(as_dataframe=False)
         self.assertEqual(len(all_tx), 1)
 
-        self.db.update(tx_id, cost_per_share=210.0)
+        self.db.update(tx_id, cost_per_share=210.0, transaction_type="SELL")
         tx_updated = self.db.get_by_id(tx_id)
         self.assertEqual(tx_updated["cost_per_share"], 210.0)
+        self.assertEqual(tx_updated["transaction_type"], "SELL")
 
         self.assertTrue(self.db.delete(tx_id))
         self.assertEqual(len(self.db.get_all(as_dataframe=False)), 0)

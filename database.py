@@ -62,6 +62,7 @@ DEFAULT_DB_URL = "sqlite:///portfolio.db"
 # Valid Enumerations
 VALID_ASSET_TYPES = {"US_STOCK", "TH_STOCK", "TH_MUTUAL_FUND"}
 VALID_CURRENCIES = {"USD", "THB"}
+VALID_TRANSACTION_TYPES = {"BUY", "SELL"}
 
 # SQLAlchemy Declarative Base
 Base = declarative_base()
@@ -205,6 +206,7 @@ class Transaction(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     portfolio_id = Column(Integer, ForeignKey("portfolios.id", ondelete="CASCADE"), nullable=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+    transaction_type = Column(String(10), nullable=False, default="BUY", server_default="BUY", index=True)
     symbol = Column(String(20), nullable=False, index=True)
     asset_type = Column(String(20), nullable=False, index=True)
     quantity = Column(Numeric(18, 8), nullable=False)
@@ -228,6 +230,7 @@ class Transaction(Base):
             "id": self.id,
             "portfolio_id": self.portfolio_id,
             "user_id": self.user_id,
+            "transaction_type": self.transaction_type or "BUY",
             "symbol": self.symbol,
             "asset_type": self.asset_type,
             "quantity": float(self.quantity) if self.quantity is not None else 0.0,
@@ -362,10 +365,14 @@ def init_db(db_url: Optional[str] = None) -> None:
                             conn.execute(text("ALTER TABLE transactions ADD COLUMN portfolio_id INTEGER"))
                         if "user_id" not in tx_cols:
                             conn.execute(text("ALTER TABLE transactions ADD COLUMN user_id INTEGER"))
+                        if "transaction_type" not in tx_cols:
+                            conn.execute(text("ALTER TABLE transactions ADD COLUMN transaction_type VARCHAR(10) DEFAULT 'BUY'"))
+                            conn.execute(text("UPDATE transactions SET transaction_type = 'BUY' WHERE transaction_type IS NULL"))
                 elif engine.dialect.name == "postgresql":
                     conn.execute(text("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"))
                     conn.execute(text("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS portfolio_id INTEGER REFERENCES portfolios(id) ON DELETE CASCADE"))
                     conn.execute(text("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id) ON DELETE CASCADE"))
+                    conn.execute(text("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS transaction_type VARCHAR(10) DEFAULT 'BUY'"))
         except Exception:
             pass
 
@@ -701,10 +708,21 @@ def _validate_and_normalize_inputs(
     asset_type: str,
     quantity: Union[int, float],
     cost_per_share: Union[int, float],
-    currency: Optional[str],
-    purchase_date: Optional[Union[str, date]],
+    currency: Optional[str] = None,
+    purchase_date: Optional[Union[str, date]] = None,
+    transaction_type: str = "BUY",
 ) -> Dict[str, Any]:
     """Validate and clean transaction input parameters."""
+    # 0. Transaction type validation
+    if transaction_type is None or not str(transaction_type).strip():
+        norm_tx_type = "BUY"
+    else:
+        norm_tx_type = str(transaction_type).strip().upper()
+    if norm_tx_type not in VALID_TRANSACTION_TYPES:
+        raise ValidationError(
+            f"Invalid transaction_type '{norm_tx_type}'. Must be one of {sorted(VALID_TRANSACTION_TYPES)}."
+        )
+
     # 1. Symbol validation
     if not symbol or not isinstance(symbol, str) or not symbol.strip():
         raise ValidationError("Symbol must be a non-empty string.")
@@ -764,6 +782,7 @@ def _validate_and_normalize_inputs(
             )
 
     return {
+        "transaction_type": norm_tx_type,
         "symbol": norm_symbol,
         "asset_type": norm_asset_type,
         "quantity": norm_quantity,
@@ -781,6 +800,7 @@ def add_transaction(
     cost_per_share: Union[int, float],
     currency: Optional[str] = None,
     purchase_date: Optional[Union[str, date]] = None,
+    transaction_type: str = "BUY",
     portfolio_id: Optional[int] = None,
     user_id: Optional[int] = None,
     db_path: Optional[str] = None,
@@ -797,6 +817,7 @@ def add_transaction(
         cost_per_share=cost_per_share,
         currency=currency,
         purchase_date=purchase_date,
+        transaction_type=transaction_type,
     )
 
     session = get_session(target_url)
@@ -804,6 +825,7 @@ def add_transaction(
         new_tx = Transaction(
             portfolio_id=portfolio_id,
             user_id=user_id,
+            transaction_type=clean_params["transaction_type"],
             symbol=clean_params["symbol"],
             asset_type=clean_params["asset_type"],
             quantity=clean_params["quantity"],
@@ -815,7 +837,7 @@ def add_transaction(
         session.commit()
         session.refresh(new_tx)
         new_id = int(new_tx.id)
-        logger.info(f"Added transaction #{new_id} for symbol '{clean_params['symbol']}' in portfolio #{portfolio_id}.")
+        logger.info(f"Added {clean_params['transaction_type']} transaction #{new_id} for symbol '{clean_params['symbol']}' in portfolio #{portfolio_id}.")
         return new_id
     except Exception as e:
         session.rollback()
@@ -895,7 +917,7 @@ def get_all_transactions(
         if as_dataframe:
             if not records:
                 return pd.DataFrame(columns=[
-                    "id", "portfolio_id", "user_id", "symbol", "asset_type", "quantity",
+                    "id", "portfolio_id", "user_id", "transaction_type", "symbol", "asset_type", "quantity",
                     "cost_per_share", "currency", "purchase_date", "created_at"
                 ])
             return pd.DataFrame(records)
@@ -1037,6 +1059,7 @@ def update_transaction(
     cost_per_share: Optional[Union[int, float]] = None,
     currency: Optional[str] = None,
     purchase_date: Optional[Union[str, date]] = None,
+    transaction_type: Optional[str] = None,
     portfolio_id: Optional[int] = None,
     db_path: Optional[str] = None,
     db_url: Optional[str] = None,
@@ -1058,6 +1081,7 @@ def update_transaction(
         new_cost = cost_per_share if cost_per_share is not None else tx.cost_per_share
         new_curr = currency if currency is not None else tx.currency
         new_date = purchase_date if purchase_date is not None else tx.purchase_date
+        new_tx_type = transaction_type if transaction_type is not None else (tx.transaction_type or "BUY")
 
         clean_params = _validate_and_normalize_inputs(
             symbol=new_sym,
@@ -1066,6 +1090,7 @@ def update_transaction(
             cost_per_share=new_cost,
             currency=new_curr,
             purchase_date=new_date,
+            transaction_type=new_tx_type,
         )
 
         tx.symbol = clean_params["symbol"]
@@ -1074,6 +1099,7 @@ def update_transaction(
         tx.cost_per_share = clean_params["cost_per_share"]
         tx.currency = clean_params["currency"]
         tx.purchase_date = clean_params["purchase_date_obj"]
+        tx.transaction_type = clean_params["transaction_type"]
         if portfolio_id is not None:
             tx.portfolio_id = portfolio_id
 
@@ -1158,6 +1184,7 @@ class PortfolioDB:
         cost_per_share: Union[int, float],
         currency: Optional[str] = None,
         purchase_date: Optional[Union[str, date]] = None,
+        transaction_type: str = "BUY",
         portfolio_id: Optional[int] = None,
         user_id: Optional[int] = None,
     ) -> int:
@@ -1168,6 +1195,7 @@ class PortfolioDB:
             cost_per_share=cost_per_share,
             currency=currency,
             purchase_date=purchase_date,
+            transaction_type=transaction_type,
             portfolio_id=portfolio_id,
             user_id=user_id,
             db_url=self.db_url,
@@ -1212,6 +1240,7 @@ class PortfolioDB:
         cost_per_share: Optional[Union[int, float]] = None,
         currency: Optional[str] = None,
         purchase_date: Optional[Union[str, date]] = None,
+        transaction_type: Optional[str] = None,
         portfolio_id: Optional[int] = None,
     ) -> bool:
         return update_transaction(
@@ -1222,6 +1251,7 @@ class PortfolioDB:
             cost_per_share=cost_per_share,
             currency=currency,
             purchase_date=purchase_date,
+            transaction_type=transaction_type,
             portfolio_id=portfolio_id,
             db_url=self.db_url,
         )

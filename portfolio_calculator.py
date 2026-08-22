@@ -29,6 +29,7 @@ from database import (
     DEFAULT_DB_PATH,
     get_all_transactions,
 )
+from fifo_calculator import calculate_fifo_portfolio
 
 # Configure module logger
 logger = logging.getLogger("portfolio_calculator")
@@ -50,14 +51,13 @@ def aggregate_transactions(
     transactions: Union[List[Dict[str, Any]], pd.DataFrame]
 ) -> List[Dict[str, Any]]:
     """Group a list or DataFrame of transactions by symbol to calculate total quantity,
-
-    total invested cost, and weighted average cost per share.
+    total invested cost, and weighted average cost per share using FIFO accounting.
 
     Args:
         transactions (List[Dict[str, Any]] | pd.DataFrame): Transaction records.
 
     Returns:
-        List[Dict[str, Any]]: Aggregated holdings list sorted by asset type and symbol.
+        List[Dict[str, Any]]: Aggregated active holdings list sorted by asset type and symbol.
     """
     if isinstance(transactions, pd.DataFrame):
         if transactions.empty:
@@ -72,48 +72,25 @@ def aggregate_transactions(
     if not tx_list:
         return []
 
-    # Grouping key: (symbol, asset_type, currency)
-    groups = defaultdict(lambda: {"total_quantity": 0.0, "total_cost": 0.0, "transaction_count": 0})
-
-    for tx in tx_list:
-        raw_symbol = tx.get("symbol", "")
-        symbol = format_ticker_symbol(raw_symbol)
-        if not symbol:
-            continue
-
-        raw_asset_type = str(tx.get("asset_type", "")).strip().upper()
-        raw_currency = str(tx.get("currency", "")).strip().upper()
-        if not raw_currency:
-            raw_currency = "USD" if raw_asset_type == "US_STOCK" else "THB"
-
-        try:
-            qty = float(tx.get("quantity", 0.0))
-            cost_per_share = float(tx.get("cost_per_share", 0.0))
-        except (ValueError, TypeError):
-            continue
-
-        if qty <= 0:
-            continue
-
-        key = (symbol, raw_asset_type, raw_currency)
-        groups[key]["total_quantity"] += qty
-        groups[key]["total_cost"] += (qty * cost_per_share)
-        groups[key]["transaction_count"] += 1
+    # Calculate active remaining unconsumed holdings using FIFO
+    fifo_result = calculate_fifo_portfolio(tx_list, auto_sort=True)
+    remaining_holdings = fifo_result.get("remaining_holdings", {})
 
     aggregated = []
-    for (symbol, asset_type, currency), data in groups.items():
-        total_qty = round(data["total_quantity"], 8)
-        total_cost = round(data["total_cost"], 4)
-        avg_cost = round(total_cost / total_qty, 6) if total_qty > 0 else 0.0
+    for symbol, data in remaining_holdings.items():
+        total_qty = data["total_quantity"]
+        total_cost = data["total_cost"]
+        avg_cost = data["avg_cost_per_share"]
 
         aggregated.append({
-            "symbol": symbol,
-            "asset_type": asset_type,
-            "currency": currency,
+            "symbol": data["symbol"],
+            "asset_type": data["asset_type"],
+            "currency": data["currency"],
             "total_quantity": total_qty,
             "total_cost": total_cost,
             "avg_cost_per_share": avg_cost,
-            "transaction_count": data["transaction_count"],
+            "transaction_count": data["lot_count"],
+            "lots": data.get("lots", []),
         })
 
     # Sort by asset_type, then symbol
@@ -402,6 +379,36 @@ def calculate_portfolio_summary(
             "weight_percent": weight,
         }
 
+    # 7. Compute Realized Performance from FIFO
+    fifo_result = calculate_fifo_portfolio(raw_txs, auto_sort=True)
+    fifo_pnl = fifo_result.get("realized_pnl", {})
+    raw_trades = fifo_pnl.get("trades", [])
+
+    closed_trades: List[Dict[str, Any]] = []
+    total_realized_pnl_thb = 0.0
+    total_realized_proceeds_thb = 0.0
+    total_realized_cost_thb = 0.0
+
+    for t in raw_trades:
+        fx = usd_thb_rate if t.get("currency") == "USD" else 1.0
+        t_copy = dict(t)
+        t_copy["realized_pnl_thb"] = round(t["realized_pnl"] * fx, 2)
+        t_copy["total_proceeds_thb"] = round(t["total_proceeds"] * fx, 2)
+        t_copy["total_cost_basis_thb"] = round(t["total_cost_basis"] * fx, 2)
+        total_realized_pnl_thb += t_copy["realized_pnl_thb"]
+        total_realized_proceeds_thb += t_copy["total_proceeds_thb"]
+        total_realized_cost_thb += t_copy["total_cost_basis_thb"]
+        closed_trades.append(t_copy)
+
+    total_realized_pnl_thb = round(total_realized_pnl_thb, 2)
+    total_realized_proceeds_thb = round(total_realized_proceeds_thb, 2)
+    total_realized_cost_thb = round(total_realized_cost_thb, 2)
+    total_realized_pnl_percent = (
+        round((total_realized_pnl_thb / total_realized_cost_thb) * 100, 2)
+        if total_realized_cost_thb > 0
+        else 0.0
+    )
+
     return {
         "timestamp": datetime.now().isoformat(),
         "usd_thb_rate": usd_thb_rate,
@@ -409,6 +416,13 @@ def calculate_portfolio_summary(
         "total_cost_thb": total_cost_thb,
         "total_unrealized_pnl_thb": total_unrealized_pnl_thb,
         "total_unrealized_pnl_percent": total_unrealized_pnl_percent,
+        "total_realized_pnl_thb": total_realized_pnl_thb,
+        "total_realized_proceeds_thb": total_realized_proceeds_thb,
+        "total_realized_cost_thb": total_realized_cost_thb,
+        "total_realized_pnl_percent": total_realized_pnl_percent,
+        "closed_trades_count": len(closed_trades),
+        "closed_trades": closed_trades,
+        "realized_pnl": fifo_pnl,
         "holdings_count": len(holdings_metrics),
         "holdings": holdings_metrics,
         "allocation_by_asset_type": allocation_by_asset_type,

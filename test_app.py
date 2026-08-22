@@ -55,6 +55,19 @@ class TestAppIntegration(unittest.TestCase):
         self.assertGreater(summary["total_cost_thb"], 0)
         self.assertEqual(summary["holdings_count"], 6)
 
+        # Verify Realized Performance metrics generated from FIFO sales
+        self.assertGreater(summary["closed_trades_count"], 0)
+        self.assertGreater(summary["total_realized_pnl_thb"], 0)
+        self.assertGreater(len(summary["closed_trades"]), 0)
+
+        # Check that AAPL has 10 remaining shares (15 bought - 5 sold)
+        aapl_holding = next(h for h in summary["holdings"] if h["symbol"] == "AAPL")
+        self.assertEqual(aapl_holding["quantity"], 10.0)
+
+        # Check that PTT.BK has 700 remaining shares (1000 bought - 300 sold)
+        ptt_holding = next(h for h in summary["holdings"] if h["symbol"] == "PTT.BK")
+        self.assertEqual(ptt_holding["quantity"], 700.0)
+
         df = get_portfolio_metrics_dataframe(summary=summary)
         self.assertEqual(len(df), 6)
         self.assertIn("Symbol", [c.title() for c in df.columns])
